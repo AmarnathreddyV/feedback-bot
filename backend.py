@@ -1,4 +1,4 @@
-```python
+
 import os
 import json
 import hmac
@@ -684,4 +684,4 @@ def get_qr():
             "Cache-Control": "no-store",
         },
     )
-```
+
