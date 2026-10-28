@@ -204,8 +204,7 @@ def list_reviews():
     from common import get_reviews
 
     try:
-        reviews = get_reviews()
-        return {"reviews": reviews}
+        return {"reviews": get_reviews()}
 
     except Exception as exc:
         print(f"Failed to retrieve reviews: {exc}")
@@ -218,8 +217,7 @@ def list_reviews():
 
 # ============================================================
 # TEMPORARY DATABASE TEST
-# DISABLED UNLESS ENABLE_TEST_REVIEW=true
-# REMOVE THIS ENDPOINT AFTER TESTING
+# ENABLE ONLY WHILE TESTING
 # ============================================================
 
 @app.post("/api/test-review")
@@ -248,7 +246,7 @@ def test_review_storage():
             ),
             analysis=analysis,
             message_id=None,
-            source="connection_test",
+            source="portal_demo",
         )
 
         return {
@@ -337,7 +335,6 @@ def verify_webhook(request: Request):
 @app.post("/webhook/whatsapp")
 async def receive_webhook(request: Request):
     raw = await request.body()
-
     signature = request.headers.get("X-Hub-Signature-256")
 
     if not verify_signature(raw, signature):
@@ -375,18 +372,21 @@ async def receive_webhook(request: Request):
                 if not wa_id or not message_text or not message_id:
                     continue
 
-                # Save the incoming message and avoid duplicate processing.
-                fresh = save_message(
-                    wa_id,
-                    "incoming",
-                    message_text,
-                    message_id,
-                )
+                try:
+                    fresh = save_message(
+                        wa_id,
+                        "incoming",
+                        message_text,
+                        message_id,
+                    )
+
+                except Exception as exc:
+                    print(f"Could not save incoming message: {exc}")
+                    continue
 
                 if not fresh:
                     continue
 
-                # Respect opt-out requests.
                 if message_text.lower() in {
                     "stop",
                     "unsubscribe",
@@ -413,7 +413,6 @@ async def receive_webhook(request: Request):
 
                     continue
 
-                # Analyze the feedback.
                 try:
                     analysis = analyze_feedback(message_text)
 
@@ -421,7 +420,6 @@ async def receive_webhook(request: Request):
                     print(f"Feedback analysis failed: {exc}")
                     continue
 
-                # Save the review before responding.
                 try:
                     review = save_review(
                         wa_id,
@@ -435,7 +433,6 @@ async def receive_webhook(request: Request):
                     print(f"Could not save review: {exc}")
                     continue
 
-                # Send the AI-generated response.
                 try:
                     reply = analysis["reply"]
 
@@ -452,7 +449,6 @@ async def receive_webhook(request: Request):
                 except Exception as exc:
                     print(f"Could not send WhatsApp reply: {exc}")
 
-                # Alert management about negative or mixed feedback.
                 if analysis.get("sentiment") in {
                     "negative",
                     "mixed",
