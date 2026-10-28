@@ -6,16 +6,16 @@ import requests
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from dotenv import load_dotenv
 
 from ai_agent import analyze_feedback
 from common import save_message, save_review, update_review_status
 
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 load_dotenv()
 
@@ -44,14 +44,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "PATCH", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
 
-# --------------------------------------------------
-# WhatsApp Configuration
-# --------------------------------------------------
+# ============================================================
+# WHATSAPP CONFIGURATION
+# ============================================================
 
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
@@ -64,10 +64,15 @@ ALLOW_UNVERIFIED = (
     == "true"
 )
 
+ENABLE_TEST_REVIEW = (
+    os.getenv("ENABLE_TEST_REVIEW", "false").lower()
+    == "true"
+)
 
-# --------------------------------------------------
-# WhatsApp Messaging
-# --------------------------------------------------
+
+# ============================================================
+# WHATSAPP MESSAGING
+# ============================================================
 
 def send_whatsapp_text(to: str, text: str):
     if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
@@ -112,9 +117,9 @@ def send_whatsapp_text(to: str, text: str):
     return response.json()
 
 
-# --------------------------------------------------
-# Manager Notifications
-# --------------------------------------------------
+# ============================================================
+# MANAGER NOTIFICATIONS
+# ============================================================
 
 def notify_manager(review: dict, analysis: dict):
     url = os.getenv("MANAGER_WEBHOOK_URL")
@@ -150,9 +155,9 @@ def notify_manager(review: dict, analysis: dict):
         print(f"Manager notification failed: {exc}")
 
 
-# --------------------------------------------------
-# WhatsApp Webhook Signature Verification
-# --------------------------------------------------
+# ============================================================
+# WHATSAPP SIGNATURE VERIFICATION
+# ============================================================
 
 def verify_signature(
     raw_body: bytes,
@@ -175,9 +180,9 @@ def verify_signature(
     return hmac.compare_digest(expected, received)
 
 
-# --------------------------------------------------
-# Health Check
-# --------------------------------------------------
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/")
 def health():
@@ -190,16 +195,17 @@ def health():
     }
 
 
-# --------------------------------------------------
-# List Reviews
-# --------------------------------------------------
+# ============================================================
+# LIST REVIEWS
+# ============================================================
 
 @app.get("/api/reviews")
 def list_reviews():
     from common import get_reviews
 
     try:
-        return {"reviews": get_reviews()}
+        reviews = get_reviews()
+        return {"reviews": reviews}
 
     except Exception as exc:
         print(f"Failed to retrieve reviews: {exc}")
@@ -210,9 +216,59 @@ def list_reviews():
         )
 
 
-# --------------------------------------------------
-# Update Review Status
-# --------------------------------------------------
+# ============================================================
+# TEMPORARY DATABASE TEST
+# DISABLED UNLESS ENABLE_TEST_REVIEW=true
+# REMOVE THIS ENDPOINT AFTER TESTING
+# ============================================================
+
+@app.post("/api/test-review")
+def test_review_storage():
+    if not ENABLE_TEST_REVIEW:
+        raise HTTPException(
+            status_code=404,
+            detail="Not found",
+        )
+
+    from common import save_review, get_reviews
+
+    analysis = {
+        "sentiment": "positive",
+        "category": "food_quality",
+        "rating": 5,
+        "summary": "Temporary database connection test.",
+    }
+
+    try:
+        review = save_review(
+            whatsapp_id="test-customer",
+            review_text=(
+                "Temporary test review. "
+                "Delete after verification."
+            ),
+            analysis=analysis,
+            message_id=None,
+            source="connection_test",
+        )
+
+        return {
+            "success": True,
+            "review": review,
+            "total_reviews": len(get_reviews()),
+        }
+
+    except Exception as exc:
+        print(f"Test review failed: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Review storage test failed. Check Render logs.",
+        )
+
+
+# ============================================================
+# UPDATE REVIEW STATUS
+# ============================================================
 
 @app.patch("/api/reviews/{review_id}/status")
 def patch_review_status(
@@ -251,9 +307,9 @@ def patch_review_status(
         )
 
 
-# --------------------------------------------------
-# WhatsApp Webhook Verification
-# --------------------------------------------------
+# ============================================================
+# WHATSAPP WEBHOOK VERIFICATION
+# ============================================================
 
 @app.get("/webhook/whatsapp")
 def verify_webhook(request: Request):
@@ -274,9 +330,9 @@ def verify_webhook(request: Request):
     )
 
 
-# --------------------------------------------------
-# Receive WhatsApp Messages
-# --------------------------------------------------
+# ============================================================
+# RECEIVE WHATSAPP MESSAGES
+# ============================================================
 
 @app.post("/webhook/whatsapp")
 async def receive_webhook(request: Request):
@@ -319,21 +375,18 @@ async def receive_webhook(request: Request):
                 if not wa_id or not message_text or not message_id:
                     continue
 
-                try:
-                    fresh = save_message(
-                        wa_id,
-                        "incoming",
-                        message_text,
-                        message_id,
-                    )
-
-                except Exception as exc:
-                    print(f"Could not save incoming message: {exc}")
-                    continue
+                # Save the incoming message and avoid duplicate processing.
+                fresh = save_message(
+                    wa_id,
+                    "incoming",
+                    message_text,
+                    message_id,
+                )
 
                 if not fresh:
                     continue
 
+                # Respect opt-out requests.
                 if message_text.lower() in {
                     "stop",
                     "unsubscribe",
@@ -344,18 +397,23 @@ async def receive_webhook(request: Request):
                         "If you need help, please contact Niloufer Café directly."
                     )
 
-                    send_whatsapp_text(wa_id, opt_out_reply)
+                    try:
+                        send_whatsapp_text(wa_id, opt_out_reply)
 
-                    save_message(
-                        wa_id,
-                        "outgoing",
-                        opt_out_reply,
-                        None,
-                        "sent",
-                    )
+                        save_message(
+                            wa_id,
+                            "outgoing",
+                            opt_out_reply,
+                            None,
+                            "sent",
+                        )
+
+                    except Exception as exc:
+                        print(f"Could not send opt-out reply: {exc}")
 
                     continue
 
+                # Analyze the feedback.
                 try:
                     analysis = analyze_feedback(message_text)
 
@@ -363,6 +421,7 @@ async def receive_webhook(request: Request):
                     print(f"Feedback analysis failed: {exc}")
                     continue
 
+                # Save the review before responding.
                 try:
                     review = save_review(
                         wa_id,
@@ -376,6 +435,7 @@ async def receive_webhook(request: Request):
                     print(f"Could not save review: {exc}")
                     continue
 
+                # Send the AI-generated response.
                 try:
                     reply = analysis["reply"]
 
@@ -392,6 +452,7 @@ async def receive_webhook(request: Request):
                 except Exception as exc:
                     print(f"Could not send WhatsApp reply: {exc}")
 
+                # Alert management about negative or mixed feedback.
                 if analysis.get("sentiment") in {
                     "negative",
                     "mixed",
@@ -404,9 +465,9 @@ async def receive_webhook(request: Request):
     return {"status": "received"}
 
 
-# --------------------------------------------------
-# Generate WhatsApp QR Code
-# --------------------------------------------------
+# ============================================================
+# WHATSAPP QR CODE
+# ============================================================
 
 @app.get("/qr")
 def get_qr():
@@ -418,17 +479,16 @@ def get_qr():
     )
 
     if not number:
-        return {
-            "error": (
+        raise HTTPException(
+            status_code=503,
+            detail=(
                 "Set WHATSAPP_PUBLIC_NUMBER in the environment "
                 "using international digits only."
-            )
-        }
+            ),
+        )
 
     import qrcode
-
     from io import BytesIO
-    from fastapi.responses import StreamingResponse
 
     link = (
         f"https://wa.me/{number}"
