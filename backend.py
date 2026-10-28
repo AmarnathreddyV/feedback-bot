@@ -4,13 +4,22 @@ import hmac
 import hashlib
 import requests
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, Response
 from dotenv import load_dotenv
 from ai_agent import analyze_feedback
-from common import save_message, save_review
+from common import save_message, save_review, update_review_status
 
 load_dotenv()
 app = FastAPI(title="Niloufer AI Review Agent", version="0.1.0")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in FRONTEND_ORIGIN.split(",") if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
@@ -59,6 +68,22 @@ def verify_signature(raw_body: bytes, signature: str | None):
         return False
     expected = hmac.new(APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature.split("=", 1)[1])
+
+@app.get("/api/reviews")
+def list_reviews():
+    from common import get_reviews
+    return {"reviews": get_reviews()}
+
+@app.patch("/api/reviews/{review_id}/status")
+def patch_review_status(review_id: str, payload: dict):
+    status = payload.get("status")
+    if status not in ("pending", "in_progress", "resolved", "not_applicable"):
+        raise HTTPException(status_code=400, detail="Invalid complaint status")
+    try:
+        update_result = __import__("common").update_review_status(review_id, status)
+        return {"ok": True, "result": update_result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not update review status: {exc}")
 
 @app.get("/")
 def health():
