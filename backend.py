@@ -1,8 +1,12 @@
+```python
 import os
 import json
 import hmac
 import hashlib
 import requests
+
+from io import BytesIO
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,18 +14,22 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from dotenv import load_dotenv
 
 from ai_agent import analyze_feedback
-from common import save_message, save_review, update_review_status
+from common import (
+    save_message,
+    save_review,
+    update_review_status,
+)
+
+load_dotenv()
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-load_dotenv()
-
 app = FastAPI(
     title="Niloufer AI Review Agent",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 FRONTEND_ORIGIN = os.getenv(
@@ -44,13 +52,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "PATCH", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
 
 # ============================================================
-# WHATSAPP CONFIGURATION
+# ENVIRONMENT VARIABLES
 # ============================================================
 
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
@@ -69,14 +77,28 @@ ENABLE_TEST_REVIEW = (
     == "true"
 )
 
+ENABLE_AI_TEST = (
+    os.getenv("ENABLE_AI_TEST", "false").lower()
+    == "true"
+)
+
 
 # ============================================================
 # WHATSAPP MESSAGING
 # ============================================================
 
-def send_whatsapp_text(to: str, text: str):
+def send_whatsapp_text(to: str, message_text: str):
+    """
+    Send a text message using the WhatsApp Cloud API.
+
+    If WhatsApp credentials are missing, use dry-run mode.
+    """
+
     if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
-        print(f"[DRY RUN] WhatsApp reply to {to}: {text}")
+        print(
+            f"[DRY RUN] WhatsApp reply to {to}: "
+            f"{message_text}"
+        )
         return {"dry_run": True}
 
     url = (
@@ -96,7 +118,7 @@ def send_whatsapp_text(to: str, text: str):
         "type": "text",
         "text": {
             "preview_url": False,
-            "body": text,
+            "body": message_text,
         },
     }
 
@@ -122,12 +144,18 @@ def send_whatsapp_text(to: str, text: str):
 # ============================================================
 
 def notify_manager(review: dict, analysis: dict):
+    """
+    Notify the configured manager webhook about
+    negative or mixed customer feedback.
+    """
+
     url = os.getenv("MANAGER_WEBHOOK_URL")
 
     if not url:
         print(
             f"[MANAGER ALERT] Negative/mixed review "
-            f"{review.get('id')}: {analysis.get('summary')}"
+            f"{review.get('id')}: "
+            f"{analysis.get('summary')}"
         )
         return
 
@@ -137,7 +165,10 @@ def notify_manager(review: dict, analysis: dict):
         "sentiment": analysis.get("sentiment"),
         "category": analysis.get("category"),
         "summary": analysis.get("summary"),
-        "branch_id": review.get("branch_id", "niloufer-main"),
+        "branch_id": review.get(
+            "branch_id",
+            "niloufer-main",
+        ),
         "complaint_status": review.get(
             "complaint_status",
             "pending",
@@ -145,11 +176,12 @@ def notify_manager(review: dict, analysis: dict):
     }
 
     try:
-        requests.post(
+        response = requests.post(
             url,
             json=payload,
             timeout=10,
-        ).raise_for_status()
+        )
+        response.raise_for_status()
 
     except Exception as exc:
         print(f"Manager notification failed: {exc}")
@@ -163,6 +195,13 @@ def verify_signature(
     raw_body: bytes,
     signature: str | None,
 ) -> bool:
+    """
+    Validate Meta's webhook signature.
+
+    Production recommendation:
+    Configure WHATSAPP_APP_SECRET in Render.
+    """
+
     if not APP_SECRET:
         return ALLOW_UNVERIFIED
 
@@ -192,6 +231,10 @@ def health():
         "whatsapp_configured": bool(
             ACCESS_TOKEN and PHONE_NUMBER_ID
         ),
+        "database_configured": bool(
+            os.getenv("SUPABASE_URL")
+            and os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        ),
     }
 
 
@@ -204,14 +247,22 @@ def list_reviews():
     from common import get_reviews
 
     try:
-        return {"reviews": get_reviews()}
+        reviews = get_reviews()
+
+        return {
+            "reviews": reviews,
+            "total_reviews": len(reviews),
+        }
 
     except Exception as exc:
         print(f"Failed to retrieve reviews: {exc}")
 
         raise HTTPException(
             status_code=500,
-            detail="Could not retrieve reviews. Check backend logs.",
+            detail=(
+                "Could not retrieve reviews. "
+                "Check backend logs."
+            ),
         )
 
 
@@ -228,7 +279,7 @@ def test_review_storage():
             detail="Not found",
         )
 
-    from common import save_review, get_reviews
+    from common import get_reviews
 
     analysis = {
         "sentiment": "positive",
@@ -260,7 +311,82 @@ def test_review_storage():
 
         raise HTTPException(
             status_code=500,
-            detail="Review storage test failed. Check Render logs.",
+            detail=(
+                "Review storage test failed. "
+                "Check Render logs."
+            ),
+        )
+
+
+# ============================================================
+# TEMPORARY OPENAI TEST
+# ENABLE ONLY WHILE TESTING
+# ============================================================
+
+@app.post("/api/test-ai")
+def test_ai():
+    """
+    Test the existing AI analysis function without
+    inserting a review into the database.
+
+    Note:
+    If ai_agent.py catches OpenAI errors and returns
+    fallback output, inspect Render logs as well.
+    """
+
+    if not ENABLE_AI_TEST:
+        raise HTTPException(
+            status_code=404,
+            detail="Not found",
+        )
+
+    test_message = (
+        "The Irani chai was delicious, "
+        "but the service was slow."
+    )
+
+    try:
+        analysis = analyze_feedback(test_message)
+
+        if not isinstance(analysis, dict):
+            raise ValueError(
+                "analyze_feedback did not return a dictionary."
+            )
+
+        required_fields = [
+            "sentiment",
+            "category",
+            "rating",
+            "summary",
+            "reply",
+        ]
+
+        missing_fields = [
+            field
+            for field in required_fields
+            if field not in analysis
+        ]
+
+        return {
+            "success": True,
+            "test_message": test_message,
+            "analysis": analysis,
+            "missing_fields": missing_fields,
+            "note": (
+                "Check the analysis and Render logs to "
+                "confirm whether OpenAI generated the result."
+            ),
+        }
+
+    except Exception as exc:
+        print(f"AI test failed: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "AI test failed. "
+                "Check Render logs for the actual error."
+            ),
         )
 
 
@@ -289,7 +415,10 @@ def patch_review_status(
         )
 
     try:
-        result = update_review_status(review_id, status)
+        result = update_review_status(
+            review_id,
+            status,
+        )
 
         return {
             "ok": True,
@@ -301,7 +430,9 @@ def patch_review_status(
 
         raise HTTPException(
             status_code=500,
-            detail="Could not update review status.",
+            detail=(
+                "Could not update review status."
+            ),
         )
 
 
@@ -335,7 +466,10 @@ def verify_webhook(request: Request):
 @app.post("/webhook/whatsapp")
 async def receive_webhook(request: Request):
     raw = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256")
+
+    signature = request.headers.get(
+        "X-Hub-Signature-256"
+    )
 
     if not verify_signature(raw, signature):
         raise HTTPException(
@@ -344,7 +478,9 @@ async def receive_webhook(request: Request):
         )
 
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(
+            raw.decode("utf-8")
+        )
 
     except Exception:
         raise HTTPException(
@@ -357,6 +493,7 @@ async def receive_webhook(request: Request):
             value = change.get("value", {})
 
             for msg in value.get("messages", []) or []:
+
                 if msg.get("type") != "text":
                     continue
 
@@ -369,9 +506,14 @@ async def receive_webhook(request: Request):
                     .strip()
                 )
 
-                if not wa_id or not message_text or not message_id:
+                if (
+                    not wa_id
+                    or not message_text
+                    or not message_id
+                ):
                     continue
 
+                # Save the incoming message.
                 try:
                     fresh = save_message(
                         wa_id,
@@ -381,24 +523,33 @@ async def receive_webhook(request: Request):
                     )
 
                 except Exception as exc:
-                    print(f"Could not save incoming message: {exc}")
+                    print(
+                        "Could not save incoming message: "
+                        f"{exc}"
+                    )
                     continue
 
+                # Avoid processing duplicate webhook deliveries.
                 if not fresh:
                     continue
 
+                # Handle opt-out requests.
                 if message_text.lower() in {
                     "stop",
                     "unsubscribe",
                     "opt out",
                 }:
                     opt_out_reply = (
-                        "You've been opted out of feedback messages. "
-                        "If you need help, please contact Niloufer Café directly."
+                        "You've been opted out of feedback "
+                        "messages. If you need help, please "
+                        "contact Niloufer Café directly."
                     )
 
                     try:
-                        send_whatsapp_text(wa_id, opt_out_reply)
+                        send_whatsapp_text(
+                            wa_id,
+                            opt_out_reply,
+                        )
 
                         save_message(
                             wa_id,
@@ -409,17 +560,26 @@ async def receive_webhook(request: Request):
                         )
 
                     except Exception as exc:
-                        print(f"Could not send opt-out reply: {exc}")
+                        print(
+                            "Could not send opt-out reply: "
+                            f"{exc}"
+                        )
 
                     continue
 
+                # Analyze feedback with the AI agent.
                 try:
-                    analysis = analyze_feedback(message_text)
+                    analysis = analyze_feedback(
+                        message_text
+                    )
 
                 except Exception as exc:
-                    print(f"Feedback analysis failed: {exc}")
+                    print(
+                        f"Feedback analysis failed: {exc}"
+                    )
                     continue
 
+                # Save the analyzed review.
                 try:
                     review = save_review(
                         wa_id,
@@ -433,10 +593,19 @@ async def receive_webhook(request: Request):
                     print(f"Could not save review: {exc}")
                     continue
 
+                # Send the AI-generated response.
                 try:
-                    reply = analysis["reply"]
+                    reply = analysis.get("reply")
 
-                    send_whatsapp_text(wa_id, reply)
+                    if not reply:
+                        raise ValueError(
+                            "AI analysis did not contain a reply."
+                        )
+
+                    send_whatsapp_text(
+                        wa_id,
+                        reply,
+                    )
 
                     save_message(
                         wa_id,
@@ -447,18 +616,26 @@ async def receive_webhook(request: Request):
                     )
 
                 except Exception as exc:
-                    print(f"Could not send WhatsApp reply: {exc}")
+                    print(
+                        "Could not send WhatsApp reply: "
+                        f"{exc}"
+                    )
 
+                # Notify the manager about negative feedback.
                 if analysis.get("sentiment") in {
                     "negative",
                     "mixed",
                 }:
                     notify_manager(
-                        review if isinstance(review, dict) else {},
+                        review if isinstance(
+                            review, dict
+                        ) else {},
                         analysis,
                     )
 
-    return {"status": "received"}
+    return {
+        "status": "received",
+    }
 
 
 # ============================================================
@@ -472,24 +649,26 @@ def get_qr():
         .strip()
         .replace("+", "")
         .replace(" ", "")
+        .replace("-", "")
     )
 
     if not number:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Set WHATSAPP_PUBLIC_NUMBER in the environment "
+                "Set WHATSAPP_PUBLIC_NUMBER in Render "
                 "using international digits only."
             ),
         )
 
     import qrcode
-    from io import BytesIO
 
     link = (
         f"https://wa.me/{number}"
-        "?text=Hi%20Niloufer%20Cafe%2C%20"
-        "I%27d%20like%20to%20share%20feedback."
+        "?text="
+        + quote(
+            "Hi Niloufer Cafe, I'd like to share feedback."
+        )
     )
 
     img = qrcode.make(link)
@@ -501,4 +680,8 @@ def get_qr():
     return StreamingResponse(
         buffer,
         media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+        },
     )
+```
