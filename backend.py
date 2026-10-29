@@ -4,6 +4,7 @@ import json
 import hmac
 import hashlib
 import requests
+from datetime import datetime, timezone
 
 from io import BytesIO
 from urllib.parse import quote
@@ -264,6 +265,110 @@ def list_reviews():
                 "Check backend logs."
             ),
         )
+
+
+# ============================================================
+# AI CUSTOMER FEEDBACK REPORT
+# ============================================================
+
+@app.post("/api/ai-report")
+def generate_ai_report():
+    """Calculate exact sentiment statistics and ask the AI for evidence-based recommendations."""
+    from collections import Counter, defaultdict
+    from common import get_reviews
+
+    try:
+        reviews = get_reviews()
+    except Exception as exc:
+        print(f"AI report: could not load reviews: {exc}")
+        raise HTTPException(status_code=500, detail="Could not load reviews from the database.")
+
+    if not reviews:
+        raise HTTPException(status_code=400, detail="No reviews are available yet. Collect customer feedback before generating a report.")
+
+    allowed = {"positive", "negative", "mixed", "neutral"}
+    counts = Counter(str(r.get("sentiment", "neutral")).lower() for r in reviews)
+    for label in allowed:
+        counts.setdefault(label, 0)
+    total = len(reviews)
+    percentages = {label: round(counts[label] * 100 / total, 1) for label in ("positive", "negative", "mixed", "neutral")}
+
+    category_counts = defaultdict(lambda: {"total": 0, "negative": 0, "mixed": 0})
+    for review in reviews:
+        category = str(review.get("category") or "other").lower()
+        category_counts[category]["total"] += 1
+        sentiment = str(review.get("sentiment") or "neutral").lower()
+        if sentiment in ("negative", "mixed"):
+            category_counts[category][sentiment] += 1
+    category_breakdown = [
+        {"category": category, **values}
+        for category, values in sorted(category_counts.items(), key=lambda item: (-(item[1]["negative"] + item[1]["mixed"]), -item[1]["total"]))
+    ]
+
+    review_evidence = []
+    for r in reviews[:250]:
+        review_evidence.append({
+            "sentiment": r.get("sentiment"),
+            "category": r.get("category"),
+            "rating": r.get("rating"),
+            "summary": r.get("ai_summary"),
+            "review": str(r.get("review_text") or "")[:500],
+        })
+
+    executive_summary = ""
+    recommendations = []
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if api_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            prompt = {
+                "task": "Analyze restaurant customer feedback and return valid JSON only.",
+                "rules": [
+                    "Use only evidence in the provided reviews; do not invent customer claims.",
+                    "Prioritize recurring actionable issues; if data is sparse, say so.",
+                    "Keep recommendations practical and specific for a cafe.",
+                    "Do not recalculate or alter the supplied sentiment percentages.",
+                    "Return keys executive_summary (string) and recommendations (array of objects with priority High/Medium/Low, title, evidence, action). Return 3-6 recommendations if evidence supports them, otherwise fewer."
+                ],
+                "calculated_statistics": {"total_reviews": total, "sentiment_counts": dict(counts), "sentiment_percentages": percentages, "category_breakdown": category_breakdown},
+                "reviews": review_evidence,
+            }
+            completion = client.chat.completions.create(
+                model=model,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "You are a careful customer-experience analyst for Niloufer Cafe. Return valid JSON only."},
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+            )
+            generated = json.loads(completion.choices[0].message.content or "{}")
+            executive_summary = str(generated.get("executive_summary") or "The available feedback has been summarized. Review category breakdowns to identify improvement opportunities.")
+            raw_recommendations = generated.get("recommendations", [])
+            if isinstance(raw_recommendations, list):
+                for item in raw_recommendations[:8]:
+                    if isinstance(item, dict) and item.get("title"):
+                        priority = str(item.get("priority", "Medium")).title()
+                        if priority not in ("High", "Medium", "Low"):
+                            priority = "Medium"
+                        recommendations.append({"priority": priority, "title": str(item["title"]), "evidence": str(item.get("evidence", "Based on available customer feedback.")), "action": str(item.get("action", "Review this issue and monitor future feedback."))})
+        except Exception as exc:
+            print(f"AI report generation failed: {exc}")
+            raise HTTPException(status_code=502, detail="AI report generation failed. Check OPENAI_API_KEY, OPENAI_MODEL, and Render logs.")
+    else:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured on the backend.")
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total_reviews": total,
+        "sentiment_counts": {label: counts[label] for label in ("positive", "negative", "mixed", "neutral")},
+        "sentiment_percentages": percentages,
+        "category_breakdown": category_breakdown,
+        "executive_summary": executive_summary,
+        "recommendations": recommendations,
+    }
 
 
 # ============================================================
@@ -684,4 +789,3 @@ def get_qr():
             "Cache-Control": "no-store",
         },
     )
-
